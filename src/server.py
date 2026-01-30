@@ -11,6 +11,8 @@ import asyncio
 import torch
 from src.utils.vad import VADProcessor
 
+import logging
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -71,7 +73,7 @@ class Settings(BaseSettings):
     max_context_tokens: int = 0
     
     # Language
-    lan: str = "en" 
+    lan: str = "de" 
     min_chunk_size: float = 0.5
     task: str = "transcribe"
     
@@ -81,7 +83,9 @@ class Settings(BaseSettings):
     logdir: str = "logs"
     
     class Config:
-        env_prefix = "WHISPER_"    
+        env_prefix = "WHISPER_"
+        env_file = ".env"
+        extra = "ignore"
 
 # Load model on app startup
 @asynccontextmanager

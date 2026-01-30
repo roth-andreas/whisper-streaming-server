@@ -9,11 +9,7 @@ services:
     volumes:
       # Logs directory
       - ./logs:/app/logs
-    environment:
-      - WHISPER_MODEL_PATH=turbo.pt
-      - WHISPER_LAN=en
-      - WHISPER_LOG_LEVEL=INFO
-    # GPU support (requires nvidia-docker)
+    env_file: .env
     deploy:
       resources:
         reservations:

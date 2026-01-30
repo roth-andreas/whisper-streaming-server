@@ -81,13 +81,6 @@ The Docker setup includes NVIDIA GPU support. Requirements:
 - NVIDIA GPU with CUDA support
 - [nvidia-docker](https://github.com/NVIDIA/nvidia-docker) installed
 
-### Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WHISPER_MODEL_PATH` | `turbo.pt` | Whisper model filename |
-| `WHISPER_LAN` | `de` | Language code |
-| `WHISPER_LOG_LEVEL` | `INFO` | Logging level |
 
 ## 🔌 WebSocket API
 
@@ -137,20 +130,53 @@ The server sends JSON messages with transcription results:
 
 ## ⚙️ Configuration
 
-Server configuration options (in `server.py`):
+The server is configured using **Environment Variables**. You can set these in your shell or use a `.env` file.
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `model_path` | `turbo.pt` | Whisper model (auto-downloaded) |
-| `beams` | `1` | Beam search size (1 = greedy) |
-| `decoder` | `greedy` | Decoder type (`greedy` or `beam`) |
+### 1. Using a `.env` File (Recommended)
 
-Available Whisper models:
-- `tiny.pt` - Fastest, lowest quality
-- `small.pt` - Good balance
-- `medium.pt` - Better quality
-- `large-v3.pt` - Best quality
-- `turbo.pt` - Optimized for speed (recommended)
+Create a `.env` file (e.g., in the root folder):
+
+```ini
+WHISPER_MODEL_PATH=turbo.pt
+WHISPER_LAN=de
+WHISPER_VAC=true
+```
+
+Start the server pointing to this file:
+
+```bash
+uvicorn src.server:app --env-file .env --host 0.0.0.0 --port 9000
+```
+
+### 2. Available Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WHISPER_MODEL_PATH` | `turbo.pt` | Model size (`tiny`, `base`, `small`, `medium`, `large-v3`, `turbo`) |
+| `WHISPER_LAN` | `de` | Language code (`de`, `en`, `es`, `fr`, etc.) |
+| `WHISPER_VAC` | `true` | Enable Voice Activity Detection |
+| `WHISPER_LOG_LEVEL` | `INFO` | Logging verbosity |
+
+### 3. Docker Configuration
+
+To use the `.env` file with Docker Compose, add the `env_file` directive:
+
+```yaml
+version: '3.8'
+services:
+  whisper-server:
+    build: .
+    env_file: .env  # Loads variables from .env file
+    ports:
+      - "9000:9000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+```
 
 ## 🏗️ Architecture
 
