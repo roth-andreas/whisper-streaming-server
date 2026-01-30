@@ -24,7 +24,6 @@ logs/
 *.swo
 
 # Environment
-.env
 .venv/
 venv/
 ENV/
