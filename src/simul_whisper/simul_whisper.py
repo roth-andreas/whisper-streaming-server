@@ -15,7 +15,7 @@ from .beam import BeamPyTorchInference
 from .eow_detection import fire_at_boundary, load_cif
 import os
 
-from token_buffer import TokenBuffer
+from src.utils.token_buffer import TokenBuffer
 
 import numpy as np
 from .generation_progress import *
@@ -139,6 +139,38 @@ class PaddedAlignAttWhisper:
             self.inference.kv_cache = self.kv_cache
 
             self.token_decoder = BeamSearchDecoder(inference=self.inference, eot=self.tokenizer.eot, beam_size=cfg.beam_size)
+
+    def save_state(self):
+        return {
+            'segments': [s.clone() for s in self.segments],
+            #'kv_cache': self.kv_cache,
+            'tokens': [t.clone() for t in self.tokens],
+            #'context_text': self.context.text,
+            #'content_token_ids': self.context.as_token_ids() if hasattr(self.context, 'as_token_ids') else None,
+            'last_attend_frame': self.last_attend_frame,
+            #'dec_attns': self.dec_attns,
+            'log_segments': self.log_segments,
+            'logdir_i': self.logdir_i
+        }
+    
+    def load_state(self, state):
+        self.segments = [s.clone() for s in state['segments']]
+        #self.kv_cache = state['kv_cache']
+        self.tokens = [t.clone() for t in state['tokens']]
+        #self.context.text = state['context_text']
+        #self.init_tokens()
+        self.init_context()
+        #self.context.content_token_ids = state['content_token_ids']
+        self.last_attend_frame = state['last_attend_frame']
+        #self.dec_attns = state['dec_attns']
+        self.log_segments = state['log_segments']
+        self.logdir_i = state['logdir_i']
+
+        self.kv_cache = {}
+        self.dec_attns = []
+        if self.decoder_type == "beam":
+            self.inference.kv_cache = self.kv_cache
+    
 
     def create_tokenizer(self, language=None):
         self.tokenizer = tokenizer.get_tokenizer(
@@ -331,278 +363,279 @@ class PaddedAlignAttWhisper:
 
     @torch.no_grad()
     def infer(self, is_last=False):
-        new_segment = True
-        if len(self.segments) == 0:
-            logger.debug("No segments, nothing to do")
-            self.logdir_save([], [], {})
-            return [], {}
-        if not self._apply_minseglen():
-            logger.debug(f"applied minseglen {self.cfg.audio_min_len} > {self.segments_len()}.")
-            input_segments = torch.cat(self.segments, dim=0)
-            self.logdir_save(input_segments, [], {})
-            return [], {}
+        with torch.amp.autocast('cuda'):
+            new_segment = True
+            if len(self.segments) == 0:
+                logger.debug("No segments, nothing to do")
+                self.logdir_save([], [], {})
+                return [], {}
+            if not self._apply_minseglen():
+                logger.debug(f"applied minseglen {self.cfg.audio_min_len} > {self.segments_len()}.")
+                input_segments = torch.cat(self.segments, dim=0)
+                self.logdir_save(input_segments, [], {})
+                return [], {}
 
-        # input_segments is concatenation of audio, it's one array
-        if len(self.segments) > 1:
-            input_segments = torch.cat(self.segments, dim=0)
-        else:
-            input_segments = self.segments[0]
-
-
-        
-        # mel + padding to 30s
-        mel_padded = log_mel_spectrogram(input_segments, n_mels=self.model.dims.n_mels, padding=N_SAMPLES, 
-                                            device=self.model.device).unsqueeze(0)
-        # trim to 3000
-        mel = pad_or_trim(mel_padded, N_FRAMES)
-
-        # the len of actual audio
-        content_mel_len = int((mel_padded.shape[2] - mel.shape[2])/2)
-
-        # encode
-        encoder_feature = self.model.encoder(mel)
-
-#        logger.debug(f"Encoder feature shape: {encoder_feature.shape}")
-#        if mel.shape[-2:] != (self.model.dims.n_audio_ctx, self.model.dims.n_audio_state):
-#            logger.debug("mel ")
-        if self.cfg.language == "auto" and self.detected_language is None:
-            language_tokens, language_probs = self.lang_id(encoder_feature) 
-            logger.debug(f"Language tokens: {language_tokens}, probs: {language_probs}")
-            top_lan, p = max(language_probs[0].items(), key=lambda x: x[1])
-            logger.info(f"Detected language: {top_lan} with p={p:.4f}")
-            #self.tokenizer.language = top_lan
-            #self.tokenizer.__post_init__()
-            self.create_tokenizer(top_lan)
-            self.detected_language = top_lan
-            self.init_tokens()
-            logger.info(f"Tokenizer language: {self.tokenizer.language}, {self.tokenizer.sot_sequence_including_notimestamps}")
-
-        self.trim_context()
-        current_tokens = self._current_tokens()
-#        
-        fire_detected = self.fire_at_boundary(encoder_feature[:, :content_mel_len, :])
-
-
-        ####################### Decoding loop
-        logger.info("Decoding loop starts\n")
-
-        sum_logprobs = torch.zeros(self.cfg.beam_size, device=mel.device)
-        completed = False
-
-        attn_of_alignment_heads = None
-        most_attended_frame = None
-
-        token_len_before_decoding = current_tokens.shape[1]
-        
-        generation_progress = []
-        generation = {
-            "starting_tokens": BeamTokens(current_tokens[0,:].clone(), self.cfg.beam_size),
-            "token_len_before_decoding": token_len_before_decoding,
-            #"fire_detected": fire_detected,
-            "frames_len": content_mel_len,
-            "frames_threshold": 4 if is_last else self.cfg.frame_threshold,
-
-            # to be filled later
-            "logits_starting": None,
-
-            # to be filled later
-            "no_speech_prob": None,
-            "no_speech": False,
-
-            # to be filled in the loop
-            "progress": generation_progress,
-        }
-        while not completed and current_tokens.shape[1] < self.max_text_len: # bos is 3 tokens
-            generation_progress_loop = []
-
-            if new_segment:
-                tokens_for_logits = current_tokens
+            # input_segments is concatenation of audio, it's one array
+            if len(self.segments) > 1:
+                input_segments = torch.cat(self.segments, dim=0)
             else:
-                # only need to use the last token except in the first forward pass
-                tokens_for_logits = current_tokens[:,-1:]
-
-            logits = self.logits(tokens_for_logits, encoder_feature) # B, len(tokens), token dict size
-            if new_segment:
-                generation["logits_starting"] = Logits(logits[:,:,:])
-
-            if new_segment and self.tokenizer.no_speech is not None:
-                probs_at_sot = logits[:, self.sot_index, :].float().softmax(dim=-1)
-                no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
-                generation["no_speech_prob"] = no_speech_probs[0]
-                if no_speech_probs[0] > self.cfg.nonspeech_prob:
-                    generation["no_speech"] = True
-                    logger.info("no speech, stop")
-                    break
-
-            logits = logits[:, -1, :] # logits for the last token
-            generation_progress_loop.append(("logits_before_suppress",Logits(logits)))
-
-            # supress blank tokens only at the beginning of the segment
-            if new_segment:
-                logits[:, self.tokenizer.encode(" ") + [self.tokenizer.eot]] = -np.inf
-            new_segment = False
-            self.suppress_tokens(logits)
-            #generation_progress_loop.append(("logits_after_suppres",BeamLogits(logits[0,:].clone(), self.cfg.beam_size)))
-            generation_progress_loop.append(("logits_after_suppress",Logits(logits)))
-
-            current_tokens, completed = self.token_decoder.update(current_tokens, logits, sum_logprobs)
-            generation_progress_loop.append(("beam_tokens",Tokens(current_tokens[:,-1].clone())))
-            generation_progress_loop.append(("sum_logprobs",sum_logprobs.tolist()))
-            generation_progress_loop.append(("completed",completed))
-
-            logger.debug(f"Decoding completed: {completed}, sum_logprobs: {sum_logprobs.tolist()}, tokens: ")
-            self.debug_print_tokens(current_tokens)
+                input_segments = self.segments[0]
 
 
-            # if self.decoder_type == "beam":
-            #     logger.debug(f"Finished sequences: {self.token_decoder.finished_sequences}")
-
-            #     logprobs = F.log_softmax(logits.float(), dim=-1)
-            #     idx = 0
-            #     logger.debug(f"Beam search topk: {logprobs[idx].topk(self.cfg.beam_size + 1)}")
-            #     logger.debug(f"Greedy search argmax: {logits.argmax(dim=-1)}")
-            # if completed:
-            #     self.debug_print_tokens(current_tokens)
-
-            #     logger.debug("decode stopped because decoder completed")
-
-            attn_of_alignment_heads = [[] for _ in range(self.num_align_heads)]
-            for i, attn_mat in enumerate(self.dec_attns):
-                layer_rank = int(i % len(self.model.decoder.blocks))
-                align_heads_in_layer = self.align_source.get(layer_rank, [])
-                if len(align_heads_in_layer) == 0:
-                    continue
-                for align_head_rank, head_id in align_heads_in_layer:
-                    if self.cfg.beam_size == 1:
-                        a = attn_mat[head_id, :, :]
-                        a = a.unsqueeze(0)
-                    else:
-                        a = attn_mat[:, head_id, :, :]
-                    attn_of_alignment_heads[align_head_rank].append(a)
-            tmp = []
-            for mat in attn_of_alignment_heads:
-                t = torch.cat(mat, dim=1)
-                tmp.append(t) 
-            attn_of_alignment_heads = torch.stack(tmp, dim=1)
-#            logger.debug(str(attn_of_alignment_heads.shape) + " tttady")
-            std, mean = torch.std_mean(attn_of_alignment_heads, dim=-2, keepdim=True, unbiased=False)
-            attn_of_alignment_heads = (attn_of_alignment_heads - mean) / std
-            attn_of_alignment_heads = median_filter(attn_of_alignment_heads, 7) # from whisper.timing
-            attn_of_alignment_heads = attn_of_alignment_heads.mean(dim=1)
-#            logger.debug(str(attn_of_alignment_heads.shape) + " po mean")
-            attn_of_alignment_heads = attn_of_alignment_heads[:,:, :content_mel_len]
-#            logger.debug(str(attn_of_alignment_heads.shape) + " pak ")
-
-            # for each beam, the most attended frame is:
-            most_attended_frames = torch.argmax(attn_of_alignment_heads[:,-1,:], dim=-1)
-            generation_progress_loop.append(("most_attended_frames",most_attended_frames.clone().tolist()))
-            logger.debug(str(most_attended_frames.tolist()) + " most att frames")
-
-            most_attended_frame = most_attended_frames[0].item()
-
-
-            generation_progress.append(dict(generation_progress_loop))
-            logger.debug("current tokens" + str(current_tokens.shape))
-            if completed:
-            #    # stripping the last token, the eot
-                current_tokens = current_tokens[:, :-1]
-                break
             
-            # for some rare cases where the attention fails
-            if not is_last and self.last_attend_frame - most_attended_frame > self.cfg.rewind_threshold:
-                # TODO: check this
-                if current_tokens.shape[1] > 1 and current_tokens[0, -2] >= DEC_PAD:
-                    logger.debug("ommit rewinding from special tokens")
-                    self.last_attend_frame = most_attended_frame
+            # mel + padding to 30s
+            mel_padded = log_mel_spectrogram(input_segments, n_mels=self.model.dims.n_mels, padding=N_SAMPLES, 
+                                                device=self.model.device).unsqueeze(0)
+            # trim to 3000
+            mel = pad_or_trim(mel_padded, N_FRAMES)
+
+            # the len of actual audio
+            content_mel_len = int((mel_padded.shape[2] - mel.shape[2])/2)
+
+            # encode
+            encoder_feature = self.model.encoder(mel)
+
+    #        logger.debug(f"Encoder feature shape: {encoder_feature.shape}")
+    #        if mel.shape[-2:] != (self.model.dims.n_audio_ctx, self.model.dims.n_audio_state):
+    #            logger.debug("mel ")
+            if self.cfg.language == "auto" and self.detected_language is None:
+                language_tokens, language_probs = self.lang_id(encoder_feature) 
+                logger.debug(f"Language tokens: {language_tokens}, probs: {language_probs}")
+                top_lan, p = max(language_probs[0].items(), key=lambda x: x[1])
+                logger.info(f"Detected language: {top_lan} with p={p:.4f}")
+                #self.tokenizer.language = top_lan
+                #self.tokenizer.__post_init__()
+                self.create_tokenizer(top_lan)
+                self.detected_language = top_lan
+                self.init_tokens()
+                logger.info(f"Tokenizer language: {self.tokenizer.language}, {self.tokenizer.sot_sequence_including_notimestamps}")
+
+            self.trim_context()
+            current_tokens = self._current_tokens()
+    #        
+            fire_detected = self.fire_at_boundary(encoder_feature[:, :content_mel_len, :])
+
+
+            ####################### Decoding loop
+            logger.info("Decoding loop starts\n")
+
+            sum_logprobs = torch.zeros(self.cfg.beam_size, device=mel.device)
+            completed = False
+
+            attn_of_alignment_heads = None
+            most_attended_frame = None
+
+            token_len_before_decoding = current_tokens.shape[1]
+            
+            generation_progress = []
+            generation = {
+                "starting_tokens": BeamTokens(current_tokens[0,:].clone(), self.cfg.beam_size),
+                "token_len_before_decoding": token_len_before_decoding,
+                #"fire_detected": fire_detected,
+                "frames_len": content_mel_len,
+                "frames_threshold": 4 if is_last else self.cfg.frame_threshold,
+
+                # to be filled later
+                "logits_starting": None,
+
+                # to be filled later
+                "no_speech_prob": None,
+                "no_speech": False,
+
+                # to be filled in the loop
+                "progress": generation_progress,
+            }
+            while not completed and current_tokens.shape[1] < self.max_text_len: # bos is 3 tokens
+                generation_progress_loop = []
+
+                if new_segment:
+                    tokens_for_logits = current_tokens
                 else:
-                    logger.debug(
-                        f"[rewind detected] current attention pos: {most_attended_frame}, "
-                        f"last attention pos: {self.last_attend_frame}; omit this segment")
-                    self.last_attend_frame = -self.cfg.rewind_threshold
-                    current_tokens = torch.cat(self.tokens, dim=1) if len(self.tokens) > 0 else self.tokens[0]
+                    # only need to use the last token except in the first forward pass
+                    tokens_for_logits = current_tokens[:,-1:]
+
+                logits = self.logits(tokens_for_logits, encoder_feature) # B, len(tokens), token dict size
+                if new_segment:
+                    generation["logits_starting"] = Logits(logits[:,:,:])
+
+                if new_segment and self.tokenizer.no_speech is not None:
+                    probs_at_sot = logits[:, self.sot_index, :].float().softmax(dim=-1)
+                    no_speech_probs = probs_at_sot[:, self.tokenizer.no_speech].tolist()
+                    generation["no_speech_prob"] = no_speech_probs[0]
+                    if no_speech_probs[0] > self.cfg.nonspeech_prob:
+                        generation["no_speech"] = True
+                        logger.info("no speech, stop")
+                        break
+
+                logits = logits[:, -1, :] # logits for the last token
+                generation_progress_loop.append(("logits_before_suppress",Logits(logits)))
+
+                # supress blank tokens only at the beginning of the segment
+                if new_segment:
+                    logits[:, self.tokenizer.encode(" ") + [self.tokenizer.eot]] = -np.inf
+                new_segment = False
+                self.suppress_tokens(logits)
+                #generation_progress_loop.append(("logits_after_suppres",BeamLogits(logits[0,:].clone(), self.cfg.beam_size)))
+                generation_progress_loop.append(("logits_after_suppress",Logits(logits)))
+
+                current_tokens, completed = self.token_decoder.update(current_tokens, logits, sum_logprobs)
+                generation_progress_loop.append(("beam_tokens",Tokens(current_tokens[:,-1].clone())))
+                generation_progress_loop.append(("sum_logprobs",sum_logprobs.tolist()))
+                generation_progress_loop.append(("completed",completed))
+
+                logger.debug(f"Decoding completed: {completed}, sum_logprobs: {sum_logprobs.tolist()}, tokens: ")
+                self.debug_print_tokens(current_tokens)
+
+
+                # if self.decoder_type == "beam":
+                #     logger.debug(f"Finished sequences: {self.token_decoder.finished_sequences}")
+
+                #     logprobs = F.log_softmax(logits.float(), dim=-1)
+                #     idx = 0
+                #     logger.debug(f"Beam search topk: {logprobs[idx].topk(self.cfg.beam_size + 1)}")
+                #     logger.debug(f"Greedy search argmax: {logits.argmax(dim=-1)}")
+                # if completed:
+                #     self.debug_print_tokens(current_tokens)
+
+                #     logger.debug("decode stopped because decoder completed")
+
+                attn_of_alignment_heads = [[] for _ in range(self.num_align_heads)]
+                for i, attn_mat in enumerate(self.dec_attns):
+                    layer_rank = int(i % len(self.model.decoder.blocks))
+                    align_heads_in_layer = self.align_source.get(layer_rank, [])
+                    if len(align_heads_in_layer) == 0:
+                        continue
+                    for align_head_rank, head_id in align_heads_in_layer:
+                        if self.cfg.beam_size == 1:
+                            a = attn_mat[head_id, :, :]
+                            a = a.unsqueeze(0)
+                        else:
+                            a = attn_mat[:, head_id, :, :]
+                        attn_of_alignment_heads[align_head_rank].append(a)
+                tmp = []
+                for mat in attn_of_alignment_heads:
+                    t = torch.cat(mat, dim=1)
+                    tmp.append(t) 
+                attn_of_alignment_heads = torch.stack(tmp, dim=1)
+    #            logger.debug(str(attn_of_alignment_heads.shape) + " tttady")
+                std, mean = torch.std_mean(attn_of_alignment_heads, dim=-2, keepdim=True, unbiased=False)
+                attn_of_alignment_heads = (attn_of_alignment_heads - mean) / std
+                attn_of_alignment_heads = median_filter(attn_of_alignment_heads, 7) # from whisper.timing
+                attn_of_alignment_heads = attn_of_alignment_heads.mean(dim=1)
+    #            logger.debug(str(attn_of_alignment_heads.shape) + " po mean")
+                attn_of_alignment_heads = attn_of_alignment_heads[:,:, :content_mel_len]
+    #            logger.debug(str(attn_of_alignment_heads.shape) + " pak ")
+
+                # for each beam, the most attended frame is:
+                most_attended_frames = torch.argmax(attn_of_alignment_heads[:,-1,:], dim=-1)
+                generation_progress_loop.append(("most_attended_frames",most_attended_frames.clone().tolist()))
+                logger.debug(str(most_attended_frames.tolist()) + " most att frames")
+
+                most_attended_frame = most_attended_frames[0].item()
+
+
+                generation_progress.append(dict(generation_progress_loop))
+                logger.debug("current tokens" + str(current_tokens.shape))
+                if completed:
+                #    # stripping the last token, the eot
+                    current_tokens = current_tokens[:, :-1]
                     break
+                
+                # for some rare cases where the attention fails
+                if not is_last and self.last_attend_frame - most_attended_frame > self.cfg.rewind_threshold:
+                    # TODO: check this
+                    if current_tokens.shape[1] > 1 and current_tokens[0, -2] >= DEC_PAD:
+                        logger.debug("ommit rewinding from special tokens")
+                        self.last_attend_frame = most_attended_frame
+                    else:
+                        logger.debug(
+                            f"[rewind detected] current attention pos: {most_attended_frame}, "
+                            f"last attention pos: {self.last_attend_frame}; omit this segment")
+                        self.last_attend_frame = -self.cfg.rewind_threshold
+                        current_tokens = torch.cat(self.tokens, dim=1) if len(self.tokens) > 0 else self.tokens[0]
+                        break
+                else:
+                    self.last_attend_frame = most_attended_frame
+
+                if content_mel_len - most_attended_frame <= (4 if is_last else self.cfg.frame_threshold):
+                    logger.debug(f"attention reaches the end: {most_attended_frame}/{content_mel_len}")
+                    # stripping the last token, the one that is attended too close to the end
+                    current_tokens = current_tokens[:, :-1]
+                    break
+            
+                # debug print
+                for i in range(self.cfg.beam_size):
+                    logger.debug("attn: {}, current pos: {}, current token: {}({})".format(
+                        attn_of_alignment_heads.shape if attn_of_alignment_heads is not None else None,
+                        most_attended_frames[i], 
+                        current_tokens[i, -1].item(),
+                        self.tokenizer.decode([current_tokens[i, -1].item()])
+                    ))
+
+    #        for k,v in generation.items():
+    #            print(k,v,file=sys.stderr)
+    #        for x in generation_progress:
+    #            for y in x.items():
+    #                print("\t\t",*y,file=sys.stderr)
+    #            print("\t","----", file=sys.stderr)
+    #        print("\t", "end of generation_progress_loop", file=sys.stderr)
+            #    sys.exit(1)
+            ####################### End of decoding loop
+
+            logger.info("End of decoding loop")
+
+            # if attn_of_alignment_heads is not None:
+            #     seg_len = int(segment.shape[0] / 16000 * TOKENS_PER_SECOND)
+
+            #     # Lets' now consider only the top hypothesis in the beam search
+            #     top_beam_attn_of_alignment_heads = attn_of_alignment_heads[0]
+
+            #     # debug print: how is the new token attended?
+            #     new_token_attn = top_beam_attn_of_alignment_heads[token_len_before_decoding:, -seg_len:]
+            #     logger.debug(f"New token attention shape: {new_token_attn.shape}")
+            #     if new_token_attn.shape[0] == 0:  # it's not attended in the current audio segment
+            #         logger.debug("no token generated")
+            #     else:  # it is, and the max attention is:
+            #         new_token_max_attn, _ = new_token_attn.max(dim=-1)
+            #         logger.debug(f"segment max attention: {new_token_max_attn.mean().item()/len(self.segments)}")
+
+
+            # let's now operate only with the top beam hypothesis
+            tokens_to_split = current_tokens[0, token_len_before_decoding:]
+            if fire_detected or is_last:
+                new_hypothesis = tokens_to_split.flatten().tolist()
             else:
-                self.last_attend_frame = most_attended_frame
+                # going to truncate the tokens after the last space
+                split_words, split_tokens = self.tokenizer.split_to_word_tokens(tokens_to_split.tolist())
+                generation["result"] = {"split_words": split_words[:-1], "split_tokens": split_tokens[:-1]}
+                generation["result_truncated"] = {"split_words": split_words[-1:], "split_tokens": split_tokens[-1:]}
 
-            if content_mel_len - most_attended_frame <= (4 if is_last else self.cfg.frame_threshold):
-                logger.debug(f"attention reaches the end: {most_attended_frame}/{content_mel_len}")
-                # stripping the last token, the one that is attended too close to the end
-                current_tokens = current_tokens[:, :-1]
-                break
-        
-            # debug print
-            for i in range(self.cfg.beam_size):
-                logger.debug("attn: {}, current pos: {}, current token: {}({})".format(
-                    attn_of_alignment_heads.shape if attn_of_alignment_heads is not None else None,
-                    most_attended_frames[i], 
-                    current_tokens[i, -1].item(),
-                    self.tokenizer.decode([current_tokens[i, -1].item()])
-                ))
-
-#        for k,v in generation.items():
-#            print(k,v,file=sys.stderr)
-#        for x in generation_progress:
-#            for y in x.items():
-#                print("\t\t",*y,file=sys.stderr)
-#            print("\t","----", file=sys.stderr)
-#        print("\t", "end of generation_progress_loop", file=sys.stderr)
-        #    sys.exit(1)
-        ####################### End of decoding loop
-
-        logger.info("End of decoding loop")
-
-        # if attn_of_alignment_heads is not None:
-        #     seg_len = int(segment.shape[0] / 16000 * TOKENS_PER_SECOND)
-
-        #     # Lets' now consider only the top hypothesis in the beam search
-        #     top_beam_attn_of_alignment_heads = attn_of_alignment_heads[0]
-
-        #     # debug print: how is the new token attended?
-        #     new_token_attn = top_beam_attn_of_alignment_heads[token_len_before_decoding:, -seg_len:]
-        #     logger.debug(f"New token attention shape: {new_token_attn.shape}")
-        #     if new_token_attn.shape[0] == 0:  # it's not attended in the current audio segment
-        #         logger.debug("no token generated")
-        #     else:  # it is, and the max attention is:
-        #         new_token_max_attn, _ = new_token_attn.max(dim=-1)
-        #         logger.debug(f"segment max attention: {new_token_max_attn.mean().item()/len(self.segments)}")
+    #            text_to_split = self.tokenizer.decode(tokens_to_split)
+    #            logger.debug(f"text_to_split: {text_to_split}")
+    #            logger.debug("text at current step: {}".format(text_to_split.replace(" ", "<space>")))
+    #            text_before_space = " ".join(text_to_split.split(" ")[:-1])
+    #            logger.debug("before the last space: {}".format(text_before_space.replace(" ", "<space>")))
+                if len(split_words) > 1:
+                    new_hypothesis = [i for sublist in split_tokens[:-1] for i in sublist]  
+                else:
+                    new_hypothesis = []
 
 
-        # let's now operate only with the top beam hypothesis
-        tokens_to_split = current_tokens[0, token_len_before_decoding:]
-        if fire_detected or is_last:
-            new_hypothesis = tokens_to_split.flatten().tolist()
-        else:
-            # going to truncate the tokens after the last space
-            split_words, split_tokens = self.tokenizer.split_to_word_tokens(tokens_to_split.tolist())
-            generation["result"] = {"split_words": split_words[:-1], "split_tokens": split_tokens[:-1]}
-            generation["result_truncated"] = {"split_words": split_words[-1:], "split_tokens": split_tokens[-1:]}
+            ### new hypothesis
+            logger.debug(f"new_hypothesis: {new_hypothesis}")
+            new_tokens = torch.tensor([new_hypothesis], dtype=torch.long).repeat_interleave(self.cfg.beam_size, dim=0).to(
+                device=self.model.device,
+            )
+            self.tokens.append(new_tokens)
+            # TODO: test if this is redundant or not
+    #        ret = ret[ret<DEC_PAD]
 
-#            text_to_split = self.tokenizer.decode(tokens_to_split)
-#            logger.debug(f"text_to_split: {text_to_split}")
-#            logger.debug("text at current step: {}".format(text_to_split.replace(" ", "<space>")))
-#            text_before_space = " ".join(text_to_split.split(" ")[:-1])
-#            logger.debug("before the last space: {}".format(text_before_space.replace(" ", "<space>")))
-            if len(split_words) > 1:
-                new_hypothesis = [i for sublist in split_tokens[:-1] for i in sublist]  
-            else:
-                new_hypothesis = []
+            logger.info(f"Output: {self.tokenizer.decode(new_hypothesis)}")
+            
+            self._clean_cache()
 
-
-        ### new hypothesis
-        logger.debug(f"new_hypothesis: {new_hypothesis}")
-        new_tokens = torch.tensor([new_hypothesis], dtype=torch.long).repeat_interleave(self.cfg.beam_size, dim=0).to(
-            device=self.model.device,
-        )
-        self.tokens.append(new_tokens)
-        # TODO: test if this is redundant or not
-#        ret = ret[ret<DEC_PAD]
-
-        logger.info(f"Output: {self.tokenizer.decode(new_hypothesis)}")
-        
-        self._clean_cache()
-
-        self.logdir_save(input_segments, new_hypothesis, generation)
-        return new_hypothesis, generation
+            self.logdir_save(input_segments, new_hypothesis, generation)
+            return new_hypothesis, generation
 
     def logdir_save(self, input_segments, new_hypothesis, generation):
         """The audio and result from each iteration is saved to the logdir for debugging purposes"""

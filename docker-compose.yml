@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  whisper-server:
+    build: .
+    container_name: whisper-streaming-server
+    ports:
+      - "9000:9000"
+    volumes:
+      # Logs directory
+      - ./logs:/app/logs
+    environment:
+      - WHISPER_MODEL_PATH=turbo.pt
+      - WHISPER_LAN=en
+      - WHISPER_LOG_LEVEL=INFO
+    # GPU support (requires nvidia-docker)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped

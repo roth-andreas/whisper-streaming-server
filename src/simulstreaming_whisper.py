@@ -1,12 +1,12 @@
-from whisper_streaming.base import OnlineProcessorInterface, ASRBase
+from src.whisper_streaming.base import OnlineProcessorInterface, ASRBase
 import argparse
 
 import sys
 import logging
 import torch
 
-from simul_whisper.config import AlignAttConfig
-from simul_whisper.simul_whisper import PaddedAlignAttWhisper
+from src.simul_whisper.config import AlignAttConfig
+from src.simul_whisper.simul_whisper import PaddedAlignAttWhisper
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +148,32 @@ class SimulWhisperOnline(OnlineProcessorInterface):
 
         self.unicode_buffer = []  # hide incomplete unicode character for the next iteration
 
+    def save_state(self):
+        return {
+            "audio_chunks": [c.clone() for c in self.audio_chunks],
+            "offset": self.offset,
+            "is_last": self.is_last,
+            "beg": self.beg,
+            "end": self.end,
+            "audio_bufer_offset": self.audio_bufer_offset,
+            "last_ts": self.last_ts,
+            "model": self.model,
+            "unicode_buffer": self.unicode_buffer.copy(),
+            "model_state": self.model.save_state() if hasattr(self.model, "save_state") else None
+        }
+
+    def load_state(self, state):
+        self.audio_chunks = [c.clone() for c in state["audio_chunks"]]
+        self.offset = state["offset"]
+        self.is_last = state["is_last"]
+        self.beg = state["beg"]
+        self.end = state["end"]
+        self.audio_bufer_offset = state["audio_bufer_offset"]
+        self.last_ts = state["last_ts"]
+        self.unicode_buffer = state["unicode_buffer"].copy()
+        if state.get("model_state") is not None:
+            self.model.load_state(state["model_state"])
+
     def insert_audio_chunk(self, audio):
         self.audio_chunks.append(torch.from_numpy(audio))
 
@@ -252,9 +278,3 @@ class SimulWhisperOnline(OnlineProcessorInterface):
         self.is_last = False
         self.model.refresh_segment(complete=True)
         return o
-    
-
-if __name__ == "__main__":
-
-    from whisper_streaming.whisper_online_main import main_simulation_from_file
-    main_simulation_from_file(simul_asr_factory, add_args=simulwhisper_args)

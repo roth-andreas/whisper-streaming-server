@@ -1,0 +1,36 @@
+# Model files (downloaded at runtime)
+*.pt
+models/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Examples (not needed in container)
+examples/
+
+# Documentation
+README.md
+LICENCE.txt

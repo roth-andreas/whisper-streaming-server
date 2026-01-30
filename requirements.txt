@@ -14,4 +14,13 @@ tiktoken
 # both Whisper and SimulWhisper. SimulWhisper requires <3
 triton>=2.0.0,<3;platform_machine=="x86_64" and sys_platform=="linux" or sys_platform=="linux2"
 
+# Server dependencies
+fastapi
+uvicorn[standard]
+pydantic-settings
+websockets
+numpy
 
+# Client dependencies (not needed in Docker)
+soundcard
+websocket-client
