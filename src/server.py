@@ -148,6 +148,133 @@ async def process_and_send(client_id, buffer, websocket, ctx_mgr, online):
             "timestamp": time.time()
         })
 
+# Available model options
+AVAILABLE_MODELS = {
+    "tiny": "tiny.pt",
+    "base": "base.pt",
+    "small": "small.pt",
+    "medium": "medium.pt",
+    "large": "large-v3.pt",
+    "turbo": "turbo.pt"
+}
+
+@app.post("/config")
+async def set_config(lan: str = None, model: str = None):
+    """Update transcription configuration (language and/or model)"""
+    import gc
+    
+    changes = []
+    
+    async with app.state.model_lock:
+        try:
+             # Reload settings
+             settings = Settings()
+             
+             # Override language if provided
+             if lan:
+                 settings.lan = lan
+                 changes.append(f"language={lan}")
+             
+             # Override model if provided
+             if model:
+                 if model not in AVAILABLE_MODELS:
+                     return {"status": "error", "message": f"Unknown model: {model}. Available: {list(AVAILABLE_MODELS.keys())}"}
+                 settings.model_path = AVAILABLE_MODELS[model]
+                 changes.append(f"model={model}")
+             
+             if not changes:
+                 return {"status": "ok", "message": "No changes requested"}
+             
+             logger.info(f"Reconfiguring: {', '.join(changes)}...")
+             
+             # === CLEANUP OLD MODEL TO FREE GPU MEMORY ===
+             old_online = app.state.online
+             old_asr = app.state.asr
+             
+             # Clear references in app.state first
+             app.state.asr = None
+             app.state.online = None
+             
+             # Deep cleanup of model hierarchy
+             if old_online is not None:
+                 try:
+                     # old_online.model is PaddedAlignAttWhisper
+                     padded_model = getattr(old_online, 'model', None)
+                     if padded_model is not None:
+                         # Clear internal caches
+                         if hasattr(padded_model, 'kv_cache'):
+                             padded_model.kv_cache.clear()
+                         if hasattr(padded_model, 'dec_attns'):
+                             padded_model.dec_attns.clear()
+                         if hasattr(padded_model, 'segments'):
+                             padded_model.segments.clear()
+                         if hasattr(padded_model, 'tokens'):
+                             padded_model.tokens.clear()
+                         
+                         # padded_model.model is the actual Whisper model
+                         whisper_model = getattr(padded_model, 'model', None)
+                         if whisper_model is not None:
+                             # Move to CPU first to free GPU memory
+                             try:
+                                 whisper_model.cpu()
+                             except:
+                                 pass
+                             del whisper_model
+                         
+                         # Delete CIF model if exists
+                         if hasattr(padded_model, 'CIFLinear') and padded_model.CIFLinear is not None:
+                             try:
+                                 padded_model.CIFLinear.cpu()
+                             except:
+                                 pass
+                             del padded_model.CIFLinear
+                         
+                         del padded_model
+                     
+                     old_online.model = None
+                     del old_online
+                 except Exception as e:
+                     logger.warning(f"Error cleaning up old online processor: {e}")
+             
+             if old_asr is not None:
+                 try:
+                     if hasattr(old_asr, 'model'):
+                         old_asr.model = None
+                     del old_asr
+                 except Exception as e:
+                     logger.warning(f"Error cleaning up old ASR: {e}")
+             
+             # Multiple GC passes to ensure cleanup
+             for _ in range(3):
+                 gc.collect()
+             
+             # Clear CUDA cache
+             if torch.cuda.is_available():
+                 torch.cuda.empty_cache()
+                 torch.cuda.synchronize()
+                 allocated_mb = torch.cuda.memory_allocated() / 1024**2
+                 reserved_mb = torch.cuda.memory_reserved() / 1024**2
+                 logger.info(f"GPU memory after cleanup: Allocated={allocated_mb:.1f}MB, Reserved={reserved_mb:.1f}MB")
+             
+             # === LOAD NEW MODEL ===
+             logger.info("Loading new model...")
+             asr, online = simul_asr_factory(settings)
+             
+             # Atomic update of state
+             app.state.asr = asr 
+             app.state.online = online
+             
+             if torch.cuda.is_available():
+                 allocated_mb = torch.cuda.memory_allocated() / 1024**2
+                 logger.info(f"GPU memory after loading: Allocated={allocated_mb:.1f}MB")
+             
+             logger.info(f"Configuration updated successfully: {', '.join(changes)}")
+             return {"status": "ok", "changes": changes, "language": settings.lan, "model": model}
+        except Exception as e:
+            logger.error(f"Failed to update config: {e}")
+            return {"status": "error", "message": str(e)}
+
+
 @app.websocket("/ws/transcription")
 async def websocket_endpoint(websocket: WebSocket, client_id: str = "guest") -> None:
     
@@ -165,15 +292,21 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str = "guest") -> 
     logger.info(f"Client {client_id} connected: Loading model...")
 
     vad = VADProcessor(threshold=0.5)
-    online = app.state.online
-
-    logger.info("Model loaded successfully! Speak now (Deutsch).")
+    # Important: Access state inside the loop or re-fetch it if we support hot-swapping for existing connection
+    # But usually 'online' is bound to the connection's state? 
+    # No, 'online' is shared singleton in this architecture (switching context).
+    # So we should get it from app.state.online.
+    
+    logger.info("Client connected. Waiting for audio...")
 
     speaking = False
     MAX_CHUNKS = 200
     
     try:
         while True:
+            # Re-fetch online processor reference in case it was replaced by language switch
+            online = app.state.online
+            
             try:
                 audio_bytes = await asyncio.wait_for(websocket.receive_bytes(), timeout=0.1)
                 audio_chunk = np.load(io.BytesIO(audio_bytes), allow_pickle=False)
